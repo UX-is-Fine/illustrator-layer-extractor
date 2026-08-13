@@ -219,6 +219,60 @@ def layer_groups(doc):
     return groups, configs
 
 
+def draw_order_names(doc, pno):
+    """OCG names in the order their content first appears on the page.
+
+    This is the real z-order: PDF paints in stream order, so first-drawn is
+    backmost. It has to be read from the stream rather than taken from
+    `layer_ui_configs()`, because that array is the *layer panel* order and its
+    direction is producer-dependent — Illustrator writes it top-layer-first
+    (i.e. reversed relative to painting), while PyMuPDF-generated files write it
+    bottom-first. Trusting it inverted the z-order on real Illustrator files,
+    which put the background in front and hid the whole comp on Figma import.
+
+    Returns [] if the stream can't be parsed, in which case the caller keeps the
+    panel order.
+    """
+    try:
+        page = doc.load_page(pno)
+        ocgs = doc.get_ocgs()
+        marked = {name: xref for (name, xref, _kind) in page.get_oc_items()}
+        raw = b""
+        for xref in page.get_contents():
+            raw += doc.xref_stream(xref)
+        text = raw.decode("latin-1", "replace")
+
+        order = []
+        for match in re.finditer(r"/OC\s*/([A-Za-z0-9_.]+)\s*BDC", text):
+            xref = marked.get(match.group(1))
+            if xref in ocgs:
+                name = ocgs[xref]["name"]
+                if name not in order:
+                    order.append(name)
+        return order
+    except Exception:
+        return []
+
+
+def order_groups_by_z(groups, order):
+    """Sort top-level layers back-to-front so manifest index 0 is the backmost.
+
+    Layers missing from `order` (no content on this artboard, or a name that
+    collides) keep their relative panel position after the ones we could place.
+    """
+    if not order:
+        return list(groups)
+    rank = {}
+    for i, name in enumerate(order):
+        rank.setdefault(name, i)
+    fallback_base = len(rank)
+    return sorted(
+        groups,
+        key=lambda g: (rank[g["name"]], 0) if g["name"] in rank
+        else (fallback_base + groups.index(g), 1),
+    )
+
+
 def set_isolation(doc, all_numbers, on_numbers):
     on = set(on_numbers)
     for number in all_numbers:
@@ -331,8 +385,12 @@ def extract(
         prefix = f"a{slot + 1:02d}_" if multi else ""
         layers_out = []
 
+        # Order back-to-front per artboard, so index 0 is the backmost plane and
+        # a consumer can paint in manifest order.
+        ordered_groups = order_groups_by_z(groups, draw_order_names(doc, pno))
+
         # --- per-layer isolation ------------------------------------------------
-        for group in groups:
+        for group in ordered_groups:
             step += 1
             base_pct = 0.1 + 0.7 * (step / n_steps)
             raw_name = group["name"]

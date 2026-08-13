@@ -90,31 +90,39 @@ if (typeof UXIF_OPTIONS === "undefined") {
      * same text out of the PDF instead yields "N I G H T V I S I O N", because
      * tracking renders as individually positioned glyphs. That difference is a
      * concrete reason to derive names here rather than downstream. */
-    function firstText(item, depth) {
-        if (depth > 6) return null;
+    function collectText(item, out, depth) {
+        if (depth > 6 || out.length >= 12) return;
         try {
             if (item.typename === "TextFrame") {
                 var c = String(item.contents).replace(/\s+/g, " ");
                 c = c.replace(/^\s+|\s+$/g, "");
-                if (c.length) return c;
-                return null;
+                if (c.length) out.push(c);
+                return;
             }
             if (item.textFrames && item.textFrames.length) {
                 for (var i = 0; i < item.textFrames.length; i++) {
-                    var t = firstText(item.textFrames[i], depth + 1);
-                    if (t) return t;
+                    collectText(item.textFrames[i], out, depth + 1);
                 }
             }
             if (item.groupItems && item.groupItems.length) {
                 for (var g = 0; g < item.groupItems.length; g++) {
-                    var t2 = firstText(item.groupItems[g], depth + 1);
-                    if (t2) return t2;
+                    collectText(item.groupItems[g], out, depth + 1);
                 }
             }
         } catch (e) {
             // Some item types throw on property access; not worth failing over.
         }
-        return null;
+    }
+
+    /* Only accept text as a name when it reads like a label, not a value.
+     * Naming by first-text-found produced actively misleading results on a real
+     * game-UI file: a panel of six character cards came out as "60" because a
+     * level readout sat inside it, and others became "x", "13_60", "37_300".
+     * Requiring three consecutive letters keeps "upgrade" and "night_vision"
+     * while rejecting counters, scores, and single glyphs — a generic
+     * "group_04" beats a confidently wrong "60". */
+    function looksLikeLabel(slug) {
+        return /[a-z]{3,}/.test(slug);
     }
 
     function deriveName(item, index) {
@@ -122,11 +130,23 @@ if (typeof UXIF_OPTIONS === "undefined") {
             var fromName = sanitize(item.name);
             if (fromName.length) return fromName;
         }
-        var txt = firstText(item, 0);
-        if (txt) {
-            var fromText = sanitize(txt);
-            if (fromText.length) return fromText;
+
+        var candidates = [];
+        collectText(item, candidates, 0);
+        for (var i = 0; i < candidates.length; i++) {
+            var slug = sanitize(candidates[i]);
+            if (slug.length && looksLikeLabel(slug)) return slug;
         }
+
+        /* A text frame's own contents ARE its identity, so a numeric one is
+         * informative rather than misleading — unlike a number scavenged from
+         * inside a group. Keep it, but prefix it so the layer name can't be a
+         * bare number. */
+        if (item.typename === "TextFrame" && candidates.length) {
+            var own = sanitize(candidates[0]);
+            if (own.length) return "text_" + own;
+        }
+
         // Fall back to the item's kind so at least the type is legible.
         var kind = String(item.typename || "item")
             .replace(/Item$|Frame$/, "")

@@ -273,6 +273,49 @@ def order_groups_by_z(groups, order):
     )
 
 
+def layer_svg(doc, pno, bbox_px, scale, text_as_path):
+    """SVG for the currently-isolated layer, trimmed to its own content.
+
+    Emitting artboard-sized SVGs (the obvious approach, since the geometry is
+    already positioned) means every vector layer imports into Figma as a
+    full-canvas frame with a small piece of art somewhere inside. On a 53-layer
+    comp that is 43 stacked full-canvas frames — technically positioned right,
+    unusable in practice.
+
+    Narrowing the page's cropbox to the layer's content box makes MuPDF emit a
+    content-sized SVG: it sets width/height to the box and translates the
+    geometry into it (adding a clip path), so the file stands alone and the
+    consumer positions it at `bounds` exactly like the raster twin.
+
+    The cropbox is restored before returning — it would otherwise leak into the
+    next layer's render and the composite.
+    """
+    page = doc.load_page(pno)
+    saved = pymupdf.Rect(page.cropbox)
+    try:
+        left, top, right, bottom = bbox_px
+        # Back to unscaled page units; the render was scaled, the cropbox isn't.
+        box = pymupdf.Rect(left / scale, top / scale, right / scale, bottom / scale)
+        box = box & pymupdf.Rect(page.mediabox)
+        # PDF rejects a degenerate cropbox, and sub-point layers do occur.
+        if box.width < 1 or box.height < 1:
+            box = pymupdf.Rect(
+                box.x0, box.y0,
+                box.x0 + max(1.0, box.width), box.y0 + max(1.0, box.height),
+            )
+        page.set_cropbox(box)
+        page = doc.load_page(pno)  # reload so the narrowed box takes effect
+        return strip_empty_groups(page.get_svg_image(
+            matrix=pymupdf.Matrix(scale, scale),
+            text_as_path=text_as_path,
+        ))
+    finally:
+        try:
+            doc.load_page(pno).set_cropbox(saved)
+        except Exception:
+            pass
+
+
 def set_isolation(doc, all_numbers, on_numbers):
     on = set(on_numbers)
     for number in all_numbers:
@@ -441,14 +484,11 @@ def extract(
                 image.save(out_dir / filename, "PNG", optimize=True)
             total_files += 1
 
-            # Vector twin. Artboard-sized rather than trimmed, so a consumer can
-            # drop it at the frame origin and have it land in the right place.
+            # Vector twin, trimmed to the same box as the raster so both are
+            # placed identically at `bounds`.
             svg_filename = None
             if svg_enabled:
-                svg = strip_empty_groups(doc.load_page(pno).get_svg_image(
-                    matrix=pymupdf.Matrix(scale, scale),
-                    text_as_path=svg_text_as_path,
-                ))
+                svg = layer_svg(doc, pno, bbox, scale, svg_text_as_path)
                 svg_bytes = len(svg.encode("utf-8"))
                 if max_svg_bytes and svg_bytes > max_svg_bytes:
                     svg_enabled = False

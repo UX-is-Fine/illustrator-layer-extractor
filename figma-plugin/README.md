@@ -36,9 +36,9 @@ For each layer in each artboard of `layers.json`:
 
 - **Name:** the layer's `id` (the Illustrator layer name, with `@hints` stripped).
 - **Geometry:** in vector mode, the per-layer SVG, as real Figma vector nodes.
-  The SVG is artboard-sized with art already positioned, so it lands at the
-  frame origin.
-- **Position/size:** in raster mode, `bounds.x/y/width/height` in canvas pixels.
+- **Position/size:** `bounds.x/y/width/height` in canvas pixels, for both vector
+  and raster — the SVG is trimmed to the layer's content box, so a vector layer
+  and its raster twin land in exactly the same place and at the same size.
 - **Fill:** in raster mode, the layer's PNG or JPG as an `IMAGE` fill.
 
 ## Vector vs raster

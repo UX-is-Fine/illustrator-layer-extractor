@@ -42,13 +42,15 @@ function applyLayerProps(node, layer) {
   if (bm && bm !== "NORMAL") node.blendMode = bm;
 }
 
-// Vector path: the per-layer SVG is artboard-sized with the art already in
-// place, so the node drops in at the frame origin rather than at layer bounds.
+// Vector path: the per-layer SVG is trimmed to the layer's own content box, so
+// it is positioned at `bounds` exactly like the raster twin. (Earlier versions
+// emitted artboard-sized SVGs placed at 0,0, which imported every vector layer
+// as a full-canvas frame — correct on paper, unusable in the layers panel.)
 function importVector(svgText, layer) {
   const node = figma.createNodeFromSvg(svgText);
   applyLayerProps(node, layer);
-  node.x = 0;
-  node.y = 0;
+  node.x = layer.bounds.x;
+  node.y = layer.bounds.y;
   return node;
 }
 

@@ -19,7 +19,7 @@ Given an `.ai`, for each artboard, for each top-level Illustrator layer:
 
 - Writes a **trimmed raster** (PNG if it has real transparency, JPEG if opaque
   or marked `@opaque`) — for Unity, Unreal, and the web.
-- Writes an **artboard-sized SVG** — for Figma, as real editable vectors.
+- Writes an **SVG trimmed to the same box** — for Figma, as real editable vectors.
 - Records canvas-space bounds, visibility, and any `@key=value` hints from the
   layer name into `layers.json`.
 - Optionally bundles everything into a `.figma.zip` ready to drop into the

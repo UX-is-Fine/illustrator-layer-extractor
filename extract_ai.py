@@ -112,6 +112,29 @@ def strip_empty_groups(svg: str) -> str:
         svg = stripped
 
 
+def count_top_level_objects(doc, pno) -> int:
+    """Rough count of drawable objects at the top of a page's content stream.
+
+    Used only to detect the under-separation case: Illustrator *groups* do not
+    survive into an .ai file's PDF data (saving flattens the group tree into a
+    flat run of Form XObject invocations), so a document with everything grouped
+    under one layer exports as a single flat plane. Comparing this count against
+    the number of planes we produced lets us say so out loud instead of
+    reporting a useless success.
+    """
+    try:
+        page = doc.load_page(pno)
+        raw = b""
+        for xref in page.get_contents():
+            raw += doc.xref_stream(xref)
+        text = raw.decode("latin-1", "replace")
+        invocations = len(re.findall(r"/[A-Za-z0-9_.]+\s+Do\b", text))
+        paints = len(re.findall(r"\b(?:f|f\*|B|B\*|b|b\*|S|s)\s", text))
+        return invocations + paints
+    except Exception:
+        return 0
+
+
 def open_document(ai_path: Path):
     """Open an .ai (or .pdf) with PyMuPDF, with a targeted error for the one
     failure mode artists actually hit: PDF compatibility switched off on save."""
@@ -186,6 +209,7 @@ def extract(
     include_hidden=False,
     emit_svg=True,
     svg_text_as_path=True,
+    max_svg_mb=24.0,
     artboard=None,
     progress=None,
 ):
@@ -243,6 +267,16 @@ def extract(
     artboards_out = []
     total_files = 0
     used_filenames = set()
+    warnings = []
+
+    # Illustrator art that is mostly placed bitmaps produces enormous SVGs:
+    # MuPDF embeds every image as a base64 data URI, so one layer of a
+    # raster-heavy comp measured 259 MB across 3286 embedded bitmaps — with no
+    # vector benefit, since there are barely any real paths in it. Cap the size,
+    # and once a layer trips the cap stop attempting SVG for the rest of the
+    # document rather than burning ~30s per layer to throw each one away.
+    svg_enabled = emit_svg
+    max_svg_bytes = int(max_svg_mb * 1_000_000) if max_svg_mb and max_svg_mb > 0 else 0
     n_steps = max(1, len(page_indices) * max(1, len(groups)))
     step = 0
 
@@ -315,14 +349,26 @@ def extract(
             # Vector twin. Artboard-sized rather than trimmed, so a consumer can
             # drop it at the frame origin and have it land in the right place.
             svg_filename = None
-            if emit_svg:
+            if svg_enabled:
                 svg = strip_empty_groups(doc.load_page(pno).get_svg_image(
                     matrix=pymupdf.Matrix(scale, scale),
                     text_as_path=svg_text_as_path,
                 ))
-                svg_filename = f"{stem}.svg"
-                (out_dir / svg_filename).write_text(svg, encoding="utf-8")
-                total_files += 1
+                svg_bytes = len(svg.encode("utf-8"))
+                if max_svg_bytes and svg_bytes > max_svg_bytes:
+                    svg_enabled = False
+                    msg = (
+                        f"SVG for {name!r} would be {svg_bytes / 1e6:.0f} MB (cap "
+                        f"{max_svg_mb:g} MB) - it is mostly embedded bitmaps, not vectors. "
+                        "Skipping SVG for the rest of this document; rasters are unaffected. "
+                        "Raise --max-svg-mb to override, or pass --no-svg to skip silently."
+                    )
+                    warnings.append(msg)
+                    _log(f"  [skip svg] {msg}", base_pct)
+                else:
+                    svg_filename = f"{stem}.svg"
+                    (out_dir / svg_filename).write_text(svg, encoding="utf-8")
+                    total_files += 1
 
             layers_out.append({
                 "id": name,
@@ -365,6 +411,20 @@ def extract(
                 "hints": {},
             })
 
+        # Under-separation check: lots of art, almost no planes.
+        if len(layers_out) <= 2:
+            n_objects = count_top_level_objects(doc, pno)
+            if n_objects >= 8:
+                msg = (
+                    f"artboard {slot + 1} exported only {len(layers_out)} plane(s) but holds "
+                    f"~{n_objects} top-level objects. Illustrator groups do NOT survive into "
+                    ".ai PDF data, so grouped-but-unlayered art collapses into one flat image. "
+                    "To get one export per element, put each element on its own top-level "
+                    "layer, or run restructure.py to do that automatically (needs Illustrator)."
+                )
+                warnings.append(msg)
+                _log(f"  [WARNING] {msg}", 0.9)
+
         artboards_out.append({
             "index": slot,
             "source_index": pno + 1,
@@ -396,6 +456,7 @@ def extract(
         "composite": first["composite"],
         "layers": first["layers"],
         "artboards": artboards_out,
+        "warnings": warnings,
     }
     manifest_path = out_dir / "layers.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -430,6 +491,7 @@ def extract(
         "layer_count": layer_count,
         "artboard_count": len(artboards_out),
         "file_count": total_files,
+        "warnings": warnings,
         "canvas": (first["canvas"]["width"], first["canvas"]["height"]),
     }
 
@@ -443,6 +505,7 @@ def main():
     parser.add_argument("--artboard", type=int, default=None, help="Export only this artboard (1-based). Default: all artboards.")
     parser.add_argument("--no-svg", dest="emit_svg", action="store_false", help="Skip the per-layer SVG export (rasters only)")
     parser.add_argument("--svg-text", dest="svg_text_as_path", action="store_false", help="Keep text as text in SVG instead of converting to paths (needs the fonts on the consuming end)")
+    parser.add_argument("--max-svg-mb", type=float, default=24.0, help="Skip SVG output once a layer's SVG exceeds this size in MB (default: 24). Raster-heavy art embeds bitmaps as base64 and can reach hundreds of MB with no vector benefit. Use 0 to disable the cap.")
     parser.add_argument("--clean", action="store_true", help="Delete existing PNG/JPG/SVG/JSON in the output dir before writing")
     parser.add_argument("--zip", dest="make_zip", action="store_true", help="After extraction, also write <name>.figma.zip containing the manifest + all assets (drop into the Figma plugin)")
     parser.add_argument("--jpeg-quality", type=int, default=88, help="Quality for JPEG encoding (default: 88)")
@@ -459,6 +522,7 @@ def main():
             include_hidden=args.include_hidden,
             emit_svg=args.emit_svg,
             svg_text_as_path=args.svg_text_as_path,
+            max_svg_mb=args.max_svg_mb,
             artboard=args.artboard,
         )
     except (FileNotFoundError, ValueError) as e:
@@ -469,6 +533,9 @@ def main():
         f"\nWrote {result['manifest_path']} - {result['layer_count']} plane(s) "
         f"across {result['artboard_count']} artboard(s)."
     )
+    # Repeat warnings at the end; the per-layer log scrolls past on big files.
+    for warning in result.get("warnings", []):
+        print(f"\nWARNING: {warning}", file=sys.stderr)
     if result["zip_path"]:
         size_kb = result["zip_path"].stat().st_size / 1024
         print(f"Wrote {result['zip_path']} ({size_kb:.0f}KB) - drop into the Figma plugin.")

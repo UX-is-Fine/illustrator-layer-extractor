@@ -73,6 +73,7 @@ Common flags:
 | `--artboard N` | Export only artboard N (1-based). Default: all artboards |
 | `--no-svg` | Skip the per-layer SVG export (rasters only) |
 | `--svg-text` | Keep text as text in SVG instead of converting to paths |
+| `--max-svg-mb N` | Skip SVG once a layer's SVG exceeds N MB (default 24; `0` disables the cap) |
 | `--clean` | Wipe existing PNG/JPG/SVG/JSON in the output dir before writing |
 | `--zip` | Also write `<name>.figma.zip` for the Figma plugin |
 | `--include-hidden` | Export layers that are hidden in Illustrator |
@@ -80,6 +81,71 @@ Common flags:
 
 Because the source is vector, `--max-width` is a free choice — raise it for
 print-resolution rasters without any quality loss from the original art.
+
+## Important: layers, not groups
+
+**Illustrator groups do not survive into an `.ai` file's PDF data.** Layers do —
+they're stored as PDF Optional Content Groups. Saving flattens the group tree
+into a flat run of PDF Form XObject invocations: on a real test file, ~20 panel
+groups became 1040 flat invocations at uniform nesting depth. The hierarchy isn't
+compressed or hidden; it's gone.
+
+This is the one real asymmetry with the PSD extractor. In Photoshop, a
+document's top-level nodes *include groups*, so that tool gets group granularity
+for free. In Illustrator the equivalent unit is the **layer**.
+
+So a document with 30 tidy groups all sitting under one "Layer 1" exports as
+**one flat plane**, no matter how well organised the group tree is. The extractor
+detects this and warns loudly rather than reporting a useless success:
+
+```
+WARNING: artboard 1 exported only 1 plane(s) but holds ~1121 top-level objects.
+Illustrator groups do NOT survive into .ai PDF data, so grouped-but-unlayered
+art collapses into one flat image.
+```
+
+Two fixes:
+
+1. **Put each element on its own top-level layer** in Illustrator. Nothing else
+   needed — this is the documented convention.
+2. **Run `restructure.py`** to do it automatically (see below).
+
+## Restructuring a messy file
+
+`restructure.py` promotes each top-level group onto its own named layer and saves
+a **copy**, which the extractor then handles normally. The source file is never
+modified.
+
+```bash
+python restructure.py messy.ai              # -> messy_restructured.ai
+python extract_ai.py messy_restructured.ai --zip
+```
+
+This is the **only** step that needs Adobe software, because Illustrator's DOM is
+the only place the group tree still exists. It's a one-time cleanup on a messy
+handoff, not a runtime dependency — everything downstream stays Adobe-free:
+
+```
+messy.ai --[restructure.py + Illustrator]--> clean.ai --[extract_ai.py]--> layers + SVG + JSON
+```
+
+Layer names are derived in priority order: the item's own name if it has one,
+otherwise text found inside it, otherwise `<type>_NN`. Deriving names here rather
+than downstream matters — Illustrator's `textFrame.contents` returns the clean
+string `"NIGHT VISION"`, where reading the same text out of the PDF yields
+`"N I G H T V I S I O N"`, because letter-spacing renders as individually
+positioned glyphs.
+
+Caveats: Illustrator has **no headless mode**, so this launches the full
+application and needs an interactive desktop session — it will not run in CI.
+Layer-level opacity, blend modes, and layer clipping masks are not transferred
+onto the new layers; check the output if the source relied on them.
+
+| Flag | Purpose |
+|---|---|
+| `--out FILE` | Output path (default `<name>_restructured.ai`) |
+| `--timeout N` | Seconds to wait for Illustrator (default 600; raise it for very large files) |
+| `--keep-empty-layers` | Leave the emptied original layers in place |
 
 ## Illustrator naming convention
 
@@ -193,9 +259,20 @@ first launch needs right-click → Open to get past Gatekeeper.
   this is rare.
 - A **flattened** file (no layers) still works — each artboard exports as a
   single plane, with a warning.
+- **Art outside the artboard is clipped.** Rendering is bounded by the artboard,
+  so bleed hanging off the edge is cut at the boundary and `bounds` never goes
+  negative. This differs from the PSD extractor, where layers may extend past
+  the canvas. If you need the bleed, enlarge the artboard in Illustrator before
+  exporting.
 - Gradient meshes, complex effects (glows, feathers), and some transparency
   groups may approximate in the SVG. The raster twin is always exact, and the
   Figma plugin falls back to it if an SVG fails to parse.
+- **Raster-heavy art produces huge SVGs.** Placed bitmaps are embedded as base64
+  data URIs, so one layer of an image-heavy comp measured 259 MB across 3286
+  embedded bitmaps — with no vector benefit, since it holds almost no real paths.
+  Past `--max-svg-mb` (24 MB default) SVG output is skipped for the rest of the
+  document and rasters are used instead. Performance scale: a 674 MB `.ai`
+  extracts its rasters in ~20s.
 - Text is converted to paths by default; `--svg-text` keeps it as text but the
   consuming end then needs the fonts.
 - Clipping masks inside a layer are applied as rendered.

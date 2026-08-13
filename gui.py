@@ -95,6 +95,8 @@ class App:
         self.queue = queue.Queue()
         self.last_out_dir = None
         self.running = False
+        # Set by main() for scripted runs; quits once the extraction finishes.
+        self.exit_when_done = False
 
         # Corner logo (top-left). Full-strength, not faded — it's a brand mark, not a backdrop.
         self._logo_src = Image.open(resource_path("assets/logo.png")).convert("RGBA")
@@ -384,11 +386,22 @@ class App:
                             error=True,
                         )
                     self._set_button_enabled(True)
+                    if self.exit_when_done:
+                        print(
+                            f"layers={n} artboards={boards} "
+                            f"restructured={bool(result.get('restructured_from'))} "
+                            f"out={self.last_out_dir}"
+                        )
+                        self.root.after(100, self.root.destroy)
+                        return
                     open_in_file_manager(self.last_out_dir)
                     return
                 if kind == "error":
                     self.running = False
                     self._set_status(f"Error: {a}", error=True)
+                    if self.exit_when_done:
+                        print(f"ERROR: {a}")
+                        self.root.after(100, self.root.destroy)
                     return
                 msg, pct = a, b
                 self._set_status(msg)
@@ -500,8 +513,20 @@ class App:
 
 
 def main():
+    # An optional path argument lets the app be driven by "Open with...", by
+    # dropping a file on the exe icon, and — importantly — by an automated test.
+    # Without it the GUI's code path can only be exercised by hand, which is how
+    # a packaging regression reached a user unnoticed.
+    #   --exit-when-done  quit after the extraction finishes (for scripted runs)
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    flags = {a for a in sys.argv[1:] if a.startswith("-")}
+    start_path = args[0] if args else None
+
     root = TkinterDnD.Tk() if HAS_DND else tk.Tk()
-    App(root)
+    app = App(root)
+    if start_path:
+        app.exit_when_done = "--exit-when-done" in flags
+        root.after(300, lambda: app._start_extract(start_path))
     root.mainloop()
 
 

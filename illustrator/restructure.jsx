@@ -170,22 +170,64 @@ if (typeof UXIF_OPTIONS === "undefined") {
         return name + "_" + i;
     }
 
-    // Direct children only. `layer.pageItems` can surface nested descendants
-    // depending on version, so filter on parent identity rather than trusting it.
-    function directChildren(layer) {
+    // Direct children only. `pageItems` can surface nested descendants depending
+    // on version, so filter on parent identity rather than trusting it. Works for
+    // both Layer and GroupItem containers.
+    function directChildren(container) {
         var out = [];
-        var items = layer.pageItems;
+        var items = container.pageItems;
         for (var i = 0; i < items.length; i++) {
             var it = items[i];
             var isDirect = true;
             try {
-                isDirect = (it.parent === layer);
+                isDirect = (it.parent === container);
             } catch (e) {
                 isDirect = true;
             }
             if (isDirect) out.push(it);
         }
         return out;
+    }
+
+    /* Find the container actually worth splitting.
+     *
+     * Artists commonly wrap an entire comp in one group, so the layer has a
+     * single child and there is nothing to spread across layers. Two versions of
+     * the same test file differed exactly this way: one exported to 21 planes,
+     * the other to a single flat plane because everything sat inside one wrapper
+     * group. Descend through solitary wrappers until a container with two or
+     * more children turns up.
+     *
+     * Clipped groups are never entered: moving children out of a clip group
+     * discards the mask and changes the artwork. Compound paths aren't entered
+     * either — their children are sub-paths of one shape, not separate elements.
+     */
+    function splitTarget(layer) {
+        var container = layer;
+        var kids = directChildren(container);
+        var depth = 0;
+
+        while (kids.length === 1 && depth < 12) {
+            var only = kids[0];
+            if (only.typename !== "GroupItem") break;
+            var isClipped = false;
+            try {
+                isClipped = (only.clipped === true);
+            } catch (e) {
+                isClipped = false;
+            }
+            if (isClipped) break;
+
+            var inner = directChildren(only);
+            if (inner.length === 0) break;
+
+            container = only;
+            kids = inner;
+            depth++;
+            if (inner.length > 1) break;
+        }
+
+        return { container: container, kids: kids, depth: depth };
     }
 
     function jsonEscape(s) {
@@ -292,10 +334,20 @@ if (typeof UXIF_OPTIONS === "undefined") {
                      " sublayer(s); sublayers are left as-is and still export as part of their parent.");
             }
 
-            var kids = directChildren(layer);
+            var target = splitTarget(layer);
+            var container = target.container;
+            var kids = target.kids;
+
+            if (target.depth > 0) {
+                warn("Layer '" + layerName + "' held everything inside " + target.depth +
+                     " wrapper group(s); split the " + kids.length + " item(s) inside instead. " +
+                     "Opacity, blend modes and effects applied to the wrapper group itself are not preserved.");
+            }
+
             report.original_layers.push({
                 name: layerName,
                 children: kids.length,
+                unwrapped: target.depth,
                 locked: wasLocked,
                 hidden: wasHidden
             });
@@ -347,6 +399,17 @@ if (typeof UXIF_OPTIONS === "undefined") {
                     typename: String(item.typename)
                 });
                 createdCount++;
+            }
+
+            // Drop the wrapper group we emptied, so it doesn't linger as an
+            // empty container in the output.
+            if (container !== layer) {
+                try {
+                    if (directChildren(container).length === 0) container.remove();
+                } catch (unwrapErr) {
+                    warn("Could not remove the emptied wrapper group in '" + layerName +
+                         "': " + unwrapErr.message);
+                }
             }
 
             // The original layer should now be empty.

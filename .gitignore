@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Don't commit working art or extractor outputs by default.
+*.ai
+out/
+*_layers/
+*.figma.zip
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Figma plugin build output (if you add a TS build step later)
+figma-plugin/node_modules/
+figma-plugin/dist/
+
+# PyInstaller outputs — artists get these from GitHub Releases, not from git.
+build/
+dist/
+*.spec~

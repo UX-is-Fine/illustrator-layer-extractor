@@ -1,0 +1,73 @@
+name: Release binaries
+
+# Tag-driven release pipeline. Push a tag like `v0.1.0` and this workflow
+# builds the GUI + CLI binaries on Windows + macOS in parallel, packages the
+# Figma plugin folder as a separate zip, and attaches all five assets to the
+# matching GitHub Release. Source-of-truth lives in build.spec; this workflow
+# just runs it and packages the outputs.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # needed for softprops/action-gh-release to upload assets
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller build.spec --clean --noconfirm
+
+      - name: Package Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Move-Item "dist/Illustrator Layer Extractor.exe" "dist/Illustrator-Layer-Extractor-windows.exe"
+          Move-Item "dist/ai-extract.exe"                  "dist/Illustrator-Layer-Extractor-CLI-windows.exe"
+
+      - name: Package macOS binaries
+        # `ditto` preserves bundle metadata that `zip` mangles. The GUI .app
+        # is a directory, so it must be archived before upload. The CLI is
+        # a single binary; we still zip it for delivery uniformity.
+        if: runner.os == 'macOS'
+        run: |
+          ditto -c -k --keepParent "dist/Illustrator Layer Extractor.app" "dist/Illustrator-Layer-Extractor-macos.zip"
+          ditto -c -k              "dist/ai-extract"                      "dist/Illustrator-Layer-Extractor-CLI-macos.zip"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Illustrator-Layer-Extractor-*
+
+  package-figma-plugin:
+    name: Package Figma plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zip plugin folder
+        run: zip -r Illustrator-Layer-Extractor-Figma-Plugin.zip figma-plugin/
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Illustrator-Layer-Extractor-Figma-Plugin.zip

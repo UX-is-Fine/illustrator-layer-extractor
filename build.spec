@@ -36,19 +36,28 @@ _excludes_common = [
 # GUI variant — windowed, includes tkinter + tkinterdnd2 + asset images.
 # ---------------------------------------------------------------------------
 
+# The ExtendScript that promotes Illustrator groups onto their own layers is a
+# data file, not an import — without it here, a frozen build silently falls back
+# to a single flat plane on grouped-but-unlayered files.
+_restructure_datas = [("illustrator/restructure.jsx", "illustrator")]
+
+# extract_auto is imported inside a function guarded by try/except ImportError,
+# so name it explicitly rather than relying on static analysis finding it.
+_restructure_hidden = ["restructure"]
+
 gui_datas = [
     ("assets/icon.ico", "assets"),
     ("assets/icon.icns", "assets"),
     ("assets/logo.png", "assets"),
     ("assets/logo_watermark.png", "assets"),
-] + mu_datas + tk_datas
+] + _restructure_datas + mu_datas + tk_datas
 
 gui_a = Analysis(
     ["gui.py"],
     pathex=[],
     binaries=mu_binaries + tk_binaries,
     datas=gui_datas,
-    hiddenimports=mu_hiddenimports + tk_hiddenimports,
+    hiddenimports=mu_hiddenimports + tk_hiddenimports + _restructure_hidden,
     hookspath=[],
     runtime_hooks=[],
     excludes=_excludes_common,
@@ -96,8 +105,9 @@ cli_a = Analysis(
     ["extract_ai.py"],
     pathex=[],
     binaries=mu_binaries,
-    datas=mu_datas,
-    hiddenimports=mu_hiddenimports,
+    # The CLI's --auto/--restructure flags need the same .jsx and module.
+    datas=mu_datas + _restructure_datas,
+    hiddenimports=mu_hiddenimports + _restructure_hidden,
     hookspath=[],
     runtime_hooks=[],
     # Strip GUI-only deps so the CLI binary stays lean.

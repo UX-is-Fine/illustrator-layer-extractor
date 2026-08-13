@@ -135,6 +135,39 @@ def count_top_level_objects(doc, pno) -> int:
         return 0
 
 
+def probe_under_separated(ai_path):
+    """Cheaply decide whether a file is grouped-but-unlayered, without rendering.
+
+    Opening the document and comparing its layer count against the number of
+    drawable objects costs a fraction of a second even on a 674 MB file, whereas
+    a full extraction pass costs tens of seconds (and can waste a ~30s SVG
+    generation). Lets the auto workflow skip straight to restructuring.
+
+    Returns (under_separated, exportable_layers, top_level_objects).
+    """
+    doc = None
+    try:
+        doc = open_document(Path(ai_path))
+        groups, _ = layer_groups(doc)
+        exportable = [
+            g for g in groups
+            if not g["name"].lower().startswith(SKIP_PREFIXES) and g["visible"]
+        ]
+        worst = 0
+        for pno in range(doc.page_count):
+            worst = max(worst, count_top_level_objects(doc, pno))
+        # Mirrors the post-extraction check: few planes, plenty of art.
+        return (len(exportable) <= 2 and worst >= 8), len(exportable), worst
+    except Exception:
+        return False, 0, 0
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+
 def open_document(ai_path: Path):
     """Open an .ai (or .pdf) with PyMuPDF, with a targeted error for the one
     failure mode artists actually hit: PDF compatibility switched off on save."""
@@ -268,6 +301,10 @@ def extract(
     total_files = 0
     used_filenames = set()
     warnings = []
+    # Set when an artboard yields almost no planes despite holding lots of art —
+    # i.e. the file is grouped but not layered. Callers use this to offer or run
+    # the Illustrator restructuring pre-pass.
+    under_separated = False
 
     # Illustrator art that is mostly placed bitmaps produces enormous SVGs:
     # MuPDF embeds every image as a base64 data URI, so one layer of a
@@ -415,6 +452,7 @@ def extract(
         if len(layers_out) <= 2:
             n_objects = count_top_level_objects(doc, pno)
             if n_objects >= 8:
+                under_separated = True
                 msg = (
                     f"artboard {slot + 1} exported only {len(layers_out)} plane(s) but holds "
                     f"~{n_objects} top-level objects. Illustrator groups do NOT survive into "
@@ -457,6 +495,7 @@ def extract(
         "layers": first["layers"],
         "artboards": artboards_out,
         "warnings": warnings,
+        "under_separated": under_separated,
     }
     manifest_path = out_dir / "layers.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -492,6 +531,7 @@ def extract(
         "artboard_count": len(artboards_out),
         "file_count": total_files,
         "warnings": warnings,
+        "under_separated": under_separated,
         "canvas": (first["canvas"]["width"], first["canvas"]["height"]),
     }
 
@@ -509,7 +549,63 @@ def main():
     parser.add_argument("--clean", action="store_true", help="Delete existing PNG/JPG/SVG/JSON in the output dir before writing")
     parser.add_argument("--zip", dest="make_zip", action="store_true", help="After extraction, also write <name>.figma.zip containing the manifest + all assets (drop into the Figma plugin)")
     parser.add_argument("--jpeg-quality", type=int, default=88, help="Quality for JPEG encoding (default: 88)")
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="If the file is grouped but not layered (which otherwise exports as one flat plane), "
+             "run the Illustrator restructuring pre-pass automatically and re-extract. Needs Illustrator.",
+    )
+    parser.add_argument(
+        "--restructure",
+        action="store_true",
+        help="Always run the Illustrator restructuring pre-pass first, promoting every top-level group "
+             "onto its own layer. Needs Illustrator. Implies --auto.",
+    )
     args = parser.parse_args()
+
+    common = dict(
+        out_dir=args.out,
+        max_width=args.max_width,
+        clean=args.clean,
+        make_zip=args.make_zip,
+        jpeg_quality=args.jpeg_quality,
+        include_hidden=args.include_hidden,
+        emit_svg=args.emit_svg,
+        svg_text_as_path=args.svg_text_as_path,
+        max_svg_mb=args.max_svg_mb,
+        artboard=args.artboard,
+    )
+
+    if args.auto or args.restructure:
+        # Imported lazily so the default path never touches the Adobe-dependent
+        # module — extract_ai.py on its own requires no Illustrator install.
+        try:
+            from restructure import extract_auto
+        except ImportError as e:
+            print(f"error: --auto/--restructure needs restructure.py alongside this script ({e})", file=sys.stderr)
+            sys.exit(1)
+        try:
+            result = extract_auto(
+                args.ai_path,
+                progress=lambda m, p: print(m),
+                force_restructure=args.restructure,
+                **common,
+            )
+        except (FileNotFoundError, ValueError, RuntimeError, TimeoutError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(
+            f"\nWrote {result['manifest_path']} - {result['layer_count']} plane(s) "
+            f"across {result['artboard_count']} artboard(s)."
+        )
+        if result.get("restructured_from"):
+            print("Groups were split onto their own layers via Illustrator first.")
+        if result.get("zip_path"):
+            size_kb = result["zip_path"].stat().st_size / 1024
+            print(f"Wrote {result['zip_path']} ({size_kb:.0f}KB) - drop into the Figma plugin.")
+        for warning in result.get("warnings", []):
+            print(f"\nWARNING: {warning}", file=sys.stderr)
+        return
 
     try:
         result = extract(

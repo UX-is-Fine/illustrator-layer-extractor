@@ -321,13 +321,32 @@ class App:
 
         def work():
             try:
-                result = extract(
-                    ai_path=ai_path,
-                    out_dir=out_dir,
-                    clean=True,
-                    make_zip=True,
-                    progress=cb,
-                )
+                # extract_auto handles the case that surprises everyone: a file
+                # whose art is grouped but not layered exports as one flat plane,
+                # because Illustrator groups don't survive into .ai PDF data. It
+                # runs the Illustrator restructuring pre-pass only when needed,
+                # and falls back to the plain result if Illustrator is absent.
+                try:
+                    from restructure import extract_auto
+                except ImportError:
+                    extract_auto = None
+
+                if extract_auto is not None:
+                    result = extract_auto(
+                        ai_path,
+                        out_dir=out_dir,
+                        clean=True,
+                        make_zip=True,
+                        progress=cb,
+                    )
+                else:
+                    result = extract(
+                        ai_path=ai_path,
+                        out_dir=out_dir,
+                        clean=True,
+                        make_zip=True,
+                        progress=cb,
+                    )
                 self.queue.put(("done", result, None))
             except Exception as err:
                 self.queue.put(("error", str(err), None))
@@ -350,9 +369,20 @@ class App:
                     if boards > 1:
                         msg += f" across {boards} artboards"
                     msg += "."
+                    if result.get("restructured_from"):
+                        msg += "  (groups split via Illustrator)"
                     if result.get("zip_path"):
                         msg += f"  Figma zip: {Path(result['zip_path']).name}"
                     self._set_status(msg)
+                    # A single plane out of a busy file means groups needed
+                    # splitting and we couldn't do it — say so instead of
+                    # letting it read as success.
+                    if result.get("under_separated") and not result.get("restructured_from"):
+                        self._set_status(
+                            f"{msg}  This file is grouped but not layered - install "
+                            "Illustrator to split it into separate layers.",
+                            error=True,
+                        )
                     self._set_button_enabled(True)
                     open_in_file_manager(self.last_out_dir)
                     return

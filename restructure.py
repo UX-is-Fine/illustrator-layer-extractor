@@ -40,6 +40,19 @@ import time
 from pathlib import Path
 
 
+def resource_path(rel) -> Path:
+    """Resolve a bundled resource for both source runs and PyInstaller builds.
+
+    A frozen build unpacks data files to sys._MEIPASS, so __file__-relative
+    lookups miss the .jsx entirely and the GUI's auto-restructure silently
+    degrades to a one-plane export.
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        return Path(base) / rel
+    return Path(__file__).parent / rel
+
+
 def find_illustrator():
     """Locate the Illustrator executable, newest version first."""
     system = platform.system()
@@ -75,10 +88,12 @@ def restructure(ai_path, out_path=None, timeout=600, delete_empty=True, verbose=
 
     out_path = Path(out_path).resolve() if out_path else ai_path.with_name(f"{ai_path.stem}_restructured.ai")
 
-    script_dir = Path(__file__).parent / "illustrator"
-    main_jsx = script_dir / "restructure.jsx"
+    main_jsx = resource_path("illustrator/restructure.jsx")
     if not main_jsx.exists():
-        raise FileNotFoundError(f"Missing {main_jsx}")
+        raise FileNotFoundError(
+            f"Missing {main_jsx}. The .jsx must ship alongside this script "
+            "(and be listed in build.spec's datas for frozen builds)."
+        )
 
     # The report is how we learn what happened: Illustrator gives no useful exit
     # code, and the .jsx writes this file as its last act either way.
@@ -145,6 +160,84 @@ def restructure(ai_path, out_path=None, timeout=600, delete_empty=True, verbose=
         raise RuntimeError(f"Restructuring failed in Illustrator: {report.get('error')}")
 
     return report, out_path
+
+
+def extract_auto(
+    ai_path,
+    out_dir,
+    progress=None,
+    force_restructure=False,
+    timeout=2400,
+    **extract_kwargs,
+):
+    """Extract, and transparently restructure first when the file needs it.
+
+    This exists because the two-step workflow is a trap: extract_ai.py alone
+    cannot split Illustrator groups (they don't survive into .ai PDF data), so
+    running it on a grouped-but-unlayered file silently yields one flat plane.
+    Callers get one call that does the right thing.
+
+    Restructuring needs Illustrator. If it isn't installed we keep the
+    single-plane result and leave the warning in place rather than failing —
+    the extractor's no-Adobe-required guarantee still holds.
+
+    Returns the extract() result dict, with `restructured_from` added when a
+    pre-pass ran.
+    """
+    from extract_ai import extract, probe_under_separated
+
+    def _log(msg, pct=None):
+        if progress:
+            progress(msg, pct)
+
+    ai_path = Path(ai_path).resolve()
+    result = None
+
+    if not force_restructure:
+        # Probe rather than extracting first: a full pass on a large file costs
+        # tens of seconds and would be thrown away whenever restructuring is
+        # needed. The probe only opens the document and counts.
+        _log("Checking layer structure...", 0.01)
+        needs_split, n_layers, n_objects = probe_under_separated(ai_path)
+        if not needs_split:
+            return extract(ai_path, out_dir=out_dir, progress=progress, **extract_kwargs)
+        _log(
+            f"Grouped but unlayered ({n_layers} layer(s), ~{n_objects} objects) - "
+            "splitting groups via Illustrator...",
+            0.05,
+        )
+    else:
+        _log("Splitting groups via Illustrator...", 0.02)
+
+    if not find_illustrator():
+        if force_restructure:
+            raise RuntimeError(
+                "Restructuring needs Illustrator installed, and it was not found."
+            )
+        # No Illustrator: still produce the honest single-plane export. The
+        # extractor's own warning tells the user why it came out flat.
+        _log("Illustrator not found - exporting without splitting groups.", 0.1)
+        return extract(ai_path, out_dir=out_dir, progress=progress, **extract_kwargs)
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="uxif_auto_"))
+    clean_ai = tmp_dir / f"{ai_path.stem}_restructured.ai"
+    try:
+        report, clean_ai = restructure(
+            ai_path, out_path=clean_ai, timeout=timeout, verbose=False
+        )
+    except (RuntimeError, TimeoutError) as err:
+        if force_restructure:
+            raise
+        _log(f"Restructuring failed ({err}) - exporting without splitting groups.", 0.1)
+        return extract(ai_path, out_dir=out_dir, progress=progress, **extract_kwargs)
+
+    created = len(report.get("created", []))
+    _log(f"Split into {created} layer(s); re-extracting...", 0.1)
+
+    result = extract(clean_ai, out_dir=out_dir, progress=progress, **extract_kwargs)
+    result["restructured_from"] = str(ai_path)
+    result["restructure_report"] = report
+    return result
 
 
 def print_report(report, out_path):
